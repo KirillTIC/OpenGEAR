@@ -2,7 +2,7 @@
 name = "opengear"
 version = "0.1.0"
 edition = "2024"
-description = "OpenGEAR - Vulkan-based game engine"
+description = "OpenGEAR - Vulkan-based 2D game engine"
 
 [dependencies]
 ash = "0.38.0"
