@@ -5,11 +5,13 @@ use winit::{
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     window::{Window, WindowId},
 };
-use ash::{Entry, Instance, ext::queue_family_foreign, vk};
-use std::ffi::{CStr, CString};
+use ash::{Entry, Instance, vk};
+use std::ffi::{CString};
 
 const VALIDATION_LAYERS: &[&str] = &["VK_LAYER_KHRONOS_validation"];
 const ENABLE_VALIDATION_LAYERS: bool = cfg!(debug_assertions);
+
+const DEVICE_EXTENSIONS: &[&str] = &["VK_KHR_swapchain"];
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
@@ -44,6 +46,24 @@ fn get_required_extensions(window: &Window) -> Vec<*const i8> {
 
     extensions
 }
+
+fn check_device_extension_support(
+    instance: &Instance,
+    device: vk::PhysicalDevice,
+) -> bool {
+    let available = unsafe {
+        instance.enumerate_device_extension_properties(device)
+            .unwrap()
+    };
+    
+    DEVICE_EXTENSIONS.iter().all(|required| {
+        available.iter().any(|ext| {
+            let name = unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) };
+            name.to_str().unwrap() == *required
+        })
+    })
+}
+
 unsafe extern "system" fn debug_callback(
     severity: vk::DebugUtilsMessageSeverityFlagsEXT,
     msg_type: vk::DebugUtilsMessageTypeFlagsEXT,
@@ -139,11 +159,79 @@ fn is_device_suitable(
     let name = unsafe {
         std::ffi::CStr::from_ptr(properties.device_name.as_ptr())
     };
+    let extensions_supported = check_device_extension_support(instance, device);
+    
+    let swap_chain_adequate = if extensions_supported {
+        let support = query_swap_chain_support(device, surface_loader, surface);
+        !support.formats.is_empty() && !support.present_modes.is_empty()
+    } else {
+        false
+    };
+    
     println!("Checking device: {}", name.to_str().unwrap());
     
-    find_queue_families(instance, device, surface_loader, surface).is_complete();
+    find_queue_families(instance, device, surface_loader, surface).is_complete() 
+        && extensions_supported 
+        && swap_chain_adequate;
     let indices = find_queue_families(instance, device, surface_loader, surface);
     indices.is_complete()
+}
+
+struct SwapChainSupportDetails {
+    capabilities: vk::SurfaceCapabilitiesKHR,
+    formats: Vec<vk::SurfaceFormatKHR>,
+    present_modes: Vec<vk::PresentModeKHR>,
+}
+fn query_swap_chain_support(
+    device: vk::PhysicalDevice,
+    surface_loader: &ash::khr::surface::Instance,
+    surface: vk::SurfaceKHR,
+) ->SwapChainSupportDetails {
+    unsafe {
+        let capabilities = surface_loader
+            .get_physical_device_surface_capabilities(device, surface)
+            .unwrap();
+        let formats = surface_loader
+            .get_physical_device_surface_formats(device, surface)
+            .unwrap();
+        let present_modes = surface_loader
+            .get_physical_device_surface_present_modes(device, surface)
+            .unwrap();
+            
+        SwapChainSupportDetails { capabilities, formats, present_modes }
+    }
+}
+fn choose_swap_surface_format(formats: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
+    *formats.iter().find(|f| {
+        f.format == vk::Format::B8G8R8A8_SRGB
+            && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
+    }).unwrap_or(&formats[0])
+}
+fn choose_swap_present_mode(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
+    if modes.contains(&vk::PresentModeKHR::MAILBOX) {
+        vk::PresentModeKHR::MAILBOX
+    } else {
+        vk::PresentModeKHR::FIFO
+    }
+}
+fn choose_swap_extent(
+    capabilities: &vk::SurfaceCapabilitiesKHR,
+    window: &winit::window::Window,
+) -> vk::Extent2D {
+    if capabilities.current_extent.width != u32::MAX {
+        return capabilities.current_extent;
+    }
+    let size = window.inner_size();
+    vk::Extent2D {
+        width: size.width.clamp(
+            capabilities.min_image_extent.width,
+            capabilities.max_image_extent.width,            
+        ),
+        height: size.height.clamp(
+            capabilities.min_image_extent.height,
+            capabilities.max_image_extent.height,
+        )
+    }
 }
 
 #[derive(Default)]
@@ -161,6 +249,13 @@ struct App {
     
     debug_utils_loader: Option<ash::ext::debug_utils::Instance>,
     debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
+    
+    swapchain_loader: Option<ash::khr::swapchain::Device>,
+    swapchain: Option<vk::SwapchainKHR>,
+    swapchain_images: Vec<vk::Image>,
+    swapchain_format: vk::Format,
+    swapchain_extent: vk::Extent2D,
+    swapchain_image_views: Vec<vk::ImageView>,
 }
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -175,6 +270,8 @@ impl ApplicationHandler for App {
         self.create_surface(&window);
         self.pick_physical_device();
         self.create_logical_device();
+        self.create_swap_chain(&window);
+        self.create_image_views();
         self.window = Some(window);
         self.init_vulkan();
     }
@@ -203,6 +300,16 @@ impl ApplicationHandler for App {
 impl Drop for App {
     fn drop(&mut self) {
         unsafe {
+            let device = self.device.as_ref().unwrap();
+            for &image_view in &self.swapchain_image_views {
+                device.destroy_image_view(image_view, None);
+            }
+            if let (Some(loader), Some(swapchain)) = (
+                self.swapchain_loader.take(),
+                self.swapchain.take()
+            ) {
+                loader.destroy_swapchain(swapchain, None);
+            }
             if let Some(device) = self.device.take() {
                 device.destroy_device(None);
             }
@@ -304,9 +411,16 @@ impl App {
         let layer_ptrs: Vec<*const i8> = layer_names.iter()
             .map(|s| s.as_ptr())
             .collect();
+        let device_extension_names: Vec<std::ffi::CString> = DEVICE_EXTENSIONS.iter()
+            .map(|s| std::ffi::CString::new(*s).unwrap())
+            .collect();
+        let device_extension_ptrs: Vec<*const i8> = device_extension_names.iter()
+            .map(|s| s.as_ptr())
+            .collect();
         let mut create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
-            .enabled_features(&device_features);
+            .enabled_features(&device_features)
+            .enabled_extension_names(&device_extension_ptrs);
             
         
         if ENABLE_VALIDATION_LAYERS {
@@ -402,6 +516,97 @@ impl App {
         
         self.surface_loader = Some(surface_loader);
         self.surface = Some(surface);
+    }
+    fn create_swap_chain(&mut self, window: &winit::window::Window) {
+        let instance = self.instance.as_ref().unwrap();
+        let device = self.device.as_ref().unwrap();
+        let physical_device = self.physical_device.unwrap();
+        let surface_loader = self.surface_loader.as_ref().unwrap();
+        let surface = self.surface.unwrap();
+        let support = query_swap_chain_support(physical_device, surface_loader, surface);
+        let format = choose_swap_surface_format(&support.formats);
+        let present_mode = choose_swap_present_mode(&support.present_modes);
+        let extent = choose_swap_extent(&support.capabilities, window);
+        let mut image_count = support.capabilities.min_image_count + 1;
+        
+        if support.capabilities.max_image_count > 0 {
+            image_count = image_count.min(support.capabilities.max_image_count);
+        }
+        
+        let indices = find_queue_families(instance, physical_device, surface_loader, surface);
+        let graphics_family = indices.graphic_family.unwrap();
+        let present_family = indices.present_family.unwrap();
+        let (sharing_mode, queue_family_indicies): (vk::SharingMode, Vec<u32>) = 
+            if graphics_family != present_family {
+                (vk::SharingMode::CONCURRENT, vec![graphics_family, present_family])
+            } else {
+                (vk::SharingMode::EXCLUSIVE, vec![])
+            };
+        let create_info = vk::SwapchainCreateInfoKHR::default()
+            .surface(surface)
+            .min_image_count(image_count)
+            .image_format(format.format)
+            .image_color_space(format.color_space)
+            .image_extent(extent)
+            .image_array_layers(1)
+            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_sharing_mode(sharing_mode)
+            .queue_family_indices(&queue_family_indicies)
+            .pre_transform(support.capabilities.current_transform)
+            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+            .present_mode(present_mode)
+            .clipped(true)
+            .old_swapchain(vk::SwapchainKHR::null());
+        let swapchain_loader = ash::khr::swapchain::Device::new(instance, device);
+        let swapchain = unsafe {
+            swapchain_loader.create_swapchain(&create_info, None)
+                .expect("Failed to create swap chain!")
+        };
+        let swapchain_images = unsafe {
+            swapchain_loader.get_swapchain_images(swapchain).unwrap()
+        };
+        
+        println!("Swap chain successfully created! Images: {}", swapchain_images.len());
+        
+        self.swapchain_loader = Some(swapchain_loader);
+        self.swapchain = Some(swapchain);
+        self.swapchain_images = swapchain_images;
+        self.swapchain_format = format.format;
+        self.swapchain_extent = extent;
+    }
+    fn create_image_views(&mut self) {
+        let device = self.device.as_ref().unwrap();
+        let image_views: Vec<vk::ImageView> = self.swapchain_images
+            .iter()
+            .map(|&image| {
+                let create_info = vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(self.swapchain_format)
+                    .components(vk::ComponentMapping {
+                        r: vk::ComponentSwizzle::IDENTITY,
+                        g: vk::ComponentSwizzle::IDENTITY,
+                        b: vk::ComponentSwizzle::IDENTITY,
+                        a: vk::ComponentSwizzle::IDENTITY,
+                    })
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+                    
+                unsafe {
+                    device.create_image_view(&create_info, None)
+                        .expect("Failed to create image view!")
+                }
+            })
+            .collect();
+            
+        println!("Image views successfully created: {}", image_views.len());
+        
+        self.swapchain_image_views = image_views;
     }
 }
 
