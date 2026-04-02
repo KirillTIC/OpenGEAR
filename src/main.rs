@@ -106,6 +106,17 @@ fn find_queue_families(
         if family.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
             indicies.graphic_family = Some(i);
         }
+        
+        let present_support = unsafe {
+            surface_loader
+                .get_physical_device_surface_support(device, i, surface)
+                .unwrap_or(false)
+        };
+        
+        if present_support {
+            indicies.present_family = Some(i);
+        }
+        
         if indicies.is_complete() {
             break;
         }
@@ -113,7 +124,12 @@ fn find_queue_families(
     
     indicies
 }
-fn is_device_suitable(instance: &Instance, device: vk::PhysicalDevice) -> bool {
+fn is_device_suitable(
+    instance: &Instance,
+    device: vk::PhysicalDevice,
+    surface_loader: &ash::khr::surface::Instance,
+    surface: vk::SurfaceKHR,
+) -> bool {
     let properties = unsafe {
         instance.get_physical_device_properties(device)
     };
@@ -125,7 +141,8 @@ fn is_device_suitable(instance: &Instance, device: vk::PhysicalDevice) -> bool {
     };
     println!("Checking device: {}", name.to_str().unwrap());
     
-    let indices = find_queue_families(instance, device);
+    find_queue_families(instance, device, surface_loader, surface).is_complete();
+    let indices = find_queue_families(instance, device, surface_loader, surface);
     indices.is_complete()
 }
 
@@ -155,6 +172,7 @@ impl ApplicationHandler for App {
         let window = event_loop.create_window(window_attrs).unwrap();
         self.create_instance(&window);
         self.setup_debug_messenger();
+        self.create_surface(&window);
         self.pick_physical_device();
         self.create_logical_device();
         self.window = Some(window);
@@ -187,6 +205,12 @@ impl Drop for App {
         unsafe {
             if let Some(device) = self.device.take() {
                 device.destroy_device(None);
+            }
+            if let (Some(loader), Some(surface)) = (
+                self.surface_loader.take(),
+                self.surface.take()
+            ) {
+                loader.destroy_surface(surface, None);
             }
             if let (Some(loader), Some(messenger)) = (
                 self.debug_utils_loader.take(),
@@ -224,6 +248,8 @@ impl App {
     }
     fn pick_physical_device(&mut self) {
         let instance = self.instance.as_ref().unwrap();
+        let surface_loader = self.surface_loader.as_ref().unwrap();
+        let surface = self.surface.unwrap();
         let devices = unsafe {
             instance.enumerate_physical_devices()
                 .expect("Failed to get list of devices!")
@@ -235,7 +261,7 @@ impl App {
         
         let physical_device = devices
             .iter()
-            .find(|&&device| is_device_suitable(instance, device))
+            .find(|&&device| is_device_suitable(instance, device, surface_loader, surface))
             .expect("No suitable GPU found!");
         let properties = unsafe {
             instance.get_physical_device_properties(*physical_device)
@@ -250,12 +276,27 @@ impl App {
     fn create_logical_device(&mut self) {
         let instance = self.instance.as_ref().unwrap();
         let physical_device = self.physical_device.unwrap();
-        let indices = find_queue_families(instance, physical_device);
+        let surface_loader = self.surface_loader.as_ref().unwrap();
+        let surface = self.surface.unwrap();
+        let indices = find_queue_families(instance, physical_device, surface_loader, surface);
         let graphics_family = indices.graphic_family.unwrap();
+        let present_family = indices.present_family.unwrap();
+        
+        use std::collections::HashSet;
+        let unique_families: HashSet<u32> = [graphics_family, present_family]
+            .iter()
+            .cloned()
+            .collect();
+        
         let queue_priorities = [1.0f32];
-        let queue_create_info = vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(graphics_family)
-            .queue_priorities(&queue_priorities);
+        let queue_create_infos: Vec<vk::DeviceQueueCreateInfo> = unique_families
+            .iter()
+            .map(|&family| {
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(family)
+                    .queue_priorities(&queue_priorities)
+            })
+            .collect();
         let device_features = vk::PhysicalDeviceFeatures::default();
         let layer_names: Vec<std::ffi::CString> = VALIDATION_LAYERS.iter()
             .map(|s| std::ffi::CString::new(*s).unwrap())
@@ -263,11 +304,11 @@ impl App {
         let layer_ptrs: Vec<*const i8> = layer_names.iter()
             .map(|s| s.as_ptr())
             .collect();
-        let queue_create_infos = [queue_create_info];
         let mut create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
             .enabled_features(&device_features);
             
+        
         if ENABLE_VALIDATION_LAYERS {
             create_info = create_info.enabled_layer_names(&layer_ptrs);
         }
@@ -277,14 +318,18 @@ impl App {
                 .expect("Failed to create logical device!")
         };
         
-        println!("Logical device successfully created!");
-        
         let graphics_queue = unsafe {
             device.get_device_queue(graphics_family, 0)
         };
+        let present_queue = unsafe {
+            device.get_device_queue(present_family, 0)
+        };
+        
+        println!("Logical device successfully created!");
         
         self.device = Some(device);
         self.graphics_queue = Some(graphics_queue);
+        self.present_queue = Some(present_queue);
     }
     fn create_instance(&mut self, window: &Window) {
         let entry = unsafe { Entry::load().expect("Failed to load Vulkan!") };
